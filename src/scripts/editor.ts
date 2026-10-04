@@ -1,4 +1,21 @@
 import "@shoelace-style/shoelace/dist/shoelace.js";
+import {
+  applyReceipt,
+  completeBatchIfReady,
+  createSampleReceipt,
+  FIELD_LABELS,
+  invalidateChecksForTerm,
+  parseReceipt,
+  ReceiptValidationError,
+  resolveConflict,
+  type ConflictSide,
+  type MergeReport,
+  type PendingConflict,
+  type ReceiptGlossaryChange,
+  type ReconcileStore,
+  type ReconItem,
+  type RectField,
+} from "./reconcile.js";
 
 type BlockType = "heading" | "paragraph" | "image" | "link";
 type ReviewStatus = "pending" | "approved" | "needs-work";
@@ -18,6 +35,26 @@ interface CommentItem {
   createdAt: string;
   resolved: boolean;
   replies: CommentReply[];
+  /** 离线回执批注号，重试/重传合入时据此去重。 */
+  receiptAnnotationId?: string;
+}
+
+interface StaleCheckNotice {
+  id: string;
+  termId: string;
+  source: string;
+  blockIds: string[];
+  createdAt: string;
+  acknowledged: boolean;
+}
+
+interface MergeBatchRecord {
+  batchId: string;
+  receiptId: string;
+  mergedAt: string;
+  annotationIds: string[];
+  status: "pending-arbitration" | "completed";
+  finishedAt?: string;
 }
 
 interface ContentBlock {
@@ -58,6 +95,14 @@ interface ChapterProject {
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
   updatedAt: string;
+  /** 回执对账：两边都改过、并排待裁的字段级冲突。 */
+  pendingConflicts?: PendingConflict[];
+  /** 已合入回执批次登记，保证重试不重复增加批注和版本。 */
+  mergeBatches?: MergeBatchRecord[];
+  /** 最近一次合批的回传回执（含未匹配、待裁条目明细）。 */
+  lastMergeReport?: MergeReport;
+  /** 术语调整后作废、需要重算的旧检查结果。 */
+  staleCheckNotices?: StaleCheckNotice[];
 }
 
 interface AccessibilityIssue {
@@ -89,8 +134,8 @@ function createSeedProject(): ChapterProject {
       id: "block-p1",
       type: "paragraph",
       text: "城市中的水并非取之不尽，由于其会通过蒸发、降水以及地表径流等若干复杂过程在自然界中持续循环，因此理解这些过程对于建设具有韧性的城市具有十分重要的意义。",
-      accessibleText: "城市里的水会不断循环。它经过蒸发、降水并沿地面流动。了解这些过程，可以帮助我们建设更能适应变化的城市。",
-      changeReason: "拆分长句，把抽象表述改为更直接的说明。",
+      accessibleText: "城市里的水会不断循环。水经过蒸发、降水，还会沿地面流动。了解这些过程，可以帮助我们建设更能适应暴雨的城市。",
+      changeReason: "拆分长句，把抽象表述改为更直接的说明；本地复核时补入“暴雨”场景。",
       reviewStatus: "pending",
       comments: [],
     },
@@ -167,6 +212,9 @@ function createSeedProject(): ChapterProject {
       { id: "term-3", source: "下渗", preferred: "渗入地下", note: "避免单独使用专业词" },
     ],
     versions: [],
+    pendingConflicts: [],
+    mergeBatches: [],
+    staleCheckNotices: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -388,10 +436,22 @@ function download(filename: string, content: string, type = "text/html;charset=u
   URL.revokeObjectURL(url);
 }
 
+function normalizeProject(loaded: ChapterProject): ChapterProject {
+  return {
+    ...loaded,
+    blocks: loaded.blocks.map((block) => ({ ...block, comments: block.comments ?? [] })),
+    glossary: loaded.glossary ?? [],
+    versions: loaded.versions ?? [],
+    pendingConflicts: loaded.pendingConflicts ?? [],
+    mergeBatches: loaded.mergeBatches ?? [],
+    staleCheckNotices: loaded.staleCheckNotices ?? [],
+  };
+}
+
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 1 && stored.project?.blocks?.length) return normalizeProject(stored.project);
   } catch {
     // Fall back to the bundled sample.
   }
@@ -411,15 +471,73 @@ let showGlossary = false;
 let undoStack: ChapterProject[] = [];
 let redoStack: ChapterProject[] = [];
 let saveTimer = 0;
+let showReceipts = false;
+let receiptMessage: { tone: "success" | "error" | "info"; text: string } | null = null;
+
+const pendingConflictCount = (blockId?: string) =>
+  (project.pendingConflicts ?? []).filter(
+    (conflict) => !conflict.resolved && (blockId === undefined || conflict.blockId === blockId),
+  ).length;
+
+/** 未裁决前：有冲突的块不能审核通过；全文也不能导出。 */
+function blockHasConflict(blockId: string) {
+  return pendingConflictCount(blockId) > 0;
+}
+
+function hasPendingConflictsGlobal() {
+  return pendingConflictCount() > 0;
+}
+
+function conflictsForBlock(blockId: string): PendingConflict[] {
+  return (project.pendingConflicts ?? []).filter((conflict) => !conflict.resolved && conflict.blockId === blockId);
+}
+
+function pushStaleChecks(entries: MergeReport["staleChecks"], draft: ChapterProject) {
+  const notices = draft.staleCheckNotices ?? [];
+  const now = new Date().toISOString();
+  for (const entry of entries) {
+    if (!entry.blockIds.length) continue;
+    notices.unshift({ id: uid("stale"), termId: entry.termId, source: entry.source, blockIds: entry.blockIds, createdAt: now, acknowledged: false });
+  }
+  draft.staleCheckNotices = notices.slice(0, 30);
+}
+
+/** 编辑室内增删改术语时，同样让相关旧检查结果失效并触发重算。 */
+function invalidateGlossaryChecks(draft: ChapterProject, term: GlossaryTerm) {
+  pushStaleChecks([invalidateChecksForTerm(draft.blocks, term)], draft);
+}
+
+/** 合批完成：保存新快照（回执自动合入不额外占用手动版本名额）。 */
+function appendMergedSnapshot(draft: ChapterProject, label: string) {
+  const version = {
+    id: uid("version"),
+    label,
+    createdAt: new Date().toISOString(),
+    blocks: structuredClone(draft.blocks),
+    glossary: structuredClone(draft.glossary),
+  };
+  draft.versions.unshift(version);
+  draft.versions = draft.versions.slice(0, 10);
+  return version.id;
+}
 
 const activeBlock = () => project.blocks.find((block) => block.id === activeBlockId) ?? project.blocks[0];
 const issues = () => analyze(project);
 
+function writeStorage(label: string, target: ChapterProject = project) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: target }));
+    return true;
+  } catch (error) {
+    // 持久化失败不能破坏内存态；回执合入路径会先在副本上验证再换入。
+    document.documentElement.dataset.lastAction = `${label}失败：${error instanceof Error ? error.message : "无法写入本地存储"}`;
+    return false;
+  }
+}
+
 function saveSoon() {
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project }));
-  }, 320);
+  saveTimer = window.setTimeout(() => { writeStorage("自动保存"); }, 320);
 }
 
 function commit(label: string, update: (draft: ChapterProject) => void, renderAfter = true) {
@@ -460,12 +578,190 @@ function updateActiveBlock(update: (block: ContentBlock, draft: ChapterProject) 
   }, renderAfter);
 }
 
+function outcomeLabel(outcome: ReconItem["outcome"]) {
+  if (outcome === "merged-auto") return { label: "自动合入", tone: "ok" as const };
+  if (outcome === "conflict") return { label: "并排待裁", tone: "conflict" as const };
+  if (outcome === "comment-merged") return { label: "批注合入", tone: "ok" as const };
+  if (outcome === "duplicate") return { label: "重复跳过", tone: "muted" as const };
+  return { label: "未能定位", tone: "warn" as const };
+}
+
+function importReceiptText(raw: string, simulateWriteFailure = false) {
+  let receipt;
+  try {
+    receipt = parseReceipt(raw);
+  } catch (error) {
+    const message = error instanceof ReceiptValidationError ? error.message : "回执解析失败。";
+    receiptMessage = { tone: "error", text: message };
+    render();
+    return;
+  }
+
+  // 取消可能挂起的旧自动保存，避免回滚后被旧内容覆盖落库。
+  window.clearTimeout(saveTimer);
+
+  // 在 draft 上对账；applyReceipt 内部失败会自行回滚，persist 失败则整体放弃，不进入提交。
+  const draft = structuredClone(project);
+  const store: ReconcileStore = {
+    get project() { return draft as never; },
+    set project(value) { Object.assign(draft, value); },
+    get pendingConflicts() { return draft.pendingConflicts ?? []; },
+    set pendingConflicts(value: PendingConflict[]) { draft.pendingConflicts = value; },
+    get mergeBatches() { return draft.mergeBatches ?? []; },
+    set mergeBatches(value: MergeBatchRecord[]) { draft.mergeBatches = value; },
+    get lastReport() { return draft.lastMergeReport; },
+    set lastReport(value: MergeReport | undefined) { draft.lastMergeReport = value; },
+  };
+
+  // 先在暂存键上验证可写性：applyReceipt 失败即回滚、不换入内存态。
+  const stagingKey = `${STORAGE_KEY}.staging`;
+  let report: MergeReport;
+  try {
+    report = applyReceipt(store, receipt, {
+      simulateWriteFailure,
+      persist: (serialized) => localStorage.setItem(stagingKey, serialized),
+      serialize: () => JSON.stringify({ schema: 1, project: draft }),
+    });
+  } catch (error) {
+    try { localStorage.removeItem(stagingKey); } catch { /* 忽略清理失败 */ }
+    receiptMessage = {
+      tone: "error",
+      text: `写入失败，已恢复合并前状态，批注与版本均未落库：${error instanceof Error ? error.message : String(error)}。可直接重试，不会重复增加批注。`,
+    };
+    render();
+    return;
+  }
+
+  // 整份回执此前已合入：不生成新快照、不入撤销栈，重试零副作用。
+  const allDuplicate = report.items.length > 0 && report.items.every((item) => item.outcome === "duplicate");
+  if (allDuplicate) {
+    try { localStorage.removeItem(stagingKey); } catch { /* 忽略清理失败 */ }
+    receiptMessage = { tone: "info", text: `回执 ${report.receiptId} 此前已合入，本次重试未重复添加批注、术语或版本快照。` };
+    render();
+    return;
+  }
+
+  // 术语调整 → 相关旧检查结果标明失效、触发重算。
+  pushStaleChecks(report.staleChecks, draft);
+
+  const autoSnapshot = report.status === "completed"
+    ? appendMergedSnapshot(draft, `回执合批快照 · ${report.school}`)
+    : undefined;
+  if (autoSnapshot) report.snapshotId = autoSnapshot;
+
+  const autoCount = report.items.filter((item) => item.outcome === "merged-auto").length;
+  const commentCount = report.items.filter((item) => item.outcome === "comment-merged").length;
+  draft.updatedAt = new Date().toISOString();
+
+  // 最终态落盘：先写暂存键再替换正式键；失败则合并前状态不被破坏，内存态不换入。
+  const serialized = JSON.stringify({ schema: 1, project: draft });
+  try {
+    localStorage.setItem(stagingKey, serialized);
+  } catch {
+    receiptMessage = {
+      tone: "error",
+      text: "写入失败（本地存储不可用或空间不足），已恢复合并前状态，批注与版本均未落库，可直接重试。",
+    };
+    render();
+    return;
+  }
+  try {
+    localStorage.setItem(STORAGE_KEY, serialized);
+    localStorage.removeItem(stagingKey);
+  } catch (error) {
+    try { localStorage.removeItem(stagingKey); } catch { /* 忽略清理失败 */ }
+    receiptMessage = {
+      tone: "error",
+      text: `写入失败，已恢复合并前状态，批注与版本均未落库：${error instanceof Error ? error.message : String(error)}。可直接重试，不会重复增加批注。`,
+    };
+    render();
+    return;
+  }
+
+  undoStack = [...undoStack.slice(-49), structuredClone(project)];
+  redoStack = [];
+  project = draft;
+  document.documentElement.dataset.lastAction = "合入离线回执";
+
+  receiptMessage = {
+    tone: report.conflictCount ? "info" : "success",
+    text: report.conflictCount
+      ? `回执 ${report.receiptId} 已对账：${autoCount} 条自动合入、${commentCount} 条批注合入，${report.conflictCount} 条两边都改过并排待裁；裁决前相关块不能通过、全文不能导出。`
+      : `回执 ${report.receiptId} 合批完成（${autoCount} 条整改、${commentCount} 条批注），已生成新快照${autoSnapshot ? `（${autoSnapshot}）` : ""}，回传回执可下载。`,
+  };
+  render();
+}
+
+function arbitrateConflict(conflictId: string, resolutions: Record<RectField, ConflictSide | "">) {
+  const conflict = (project.pendingConflicts ?? []).find((item) => item.id === conflictId);
+  if (!conflict) return;
+  window.clearTimeout(saveTimer);
+  const draft = structuredClone(project);
+  const store: ReconcileStore = {
+    get project() { return draft as never; },
+    set project(value) { Object.assign(draft, value); },
+    get pendingConflicts() { return draft.pendingConflicts ?? []; },
+    set pendingConflicts(value: PendingConflict[]) { draft.pendingConflicts = value; },
+    get mergeBatches() { return draft.mergeBatches ?? []; },
+    set mergeBatches(value: MergeBatchRecord[]) { draft.mergeBatches = value; },
+    get lastReport() { return draft.lastMergeReport; },
+    set lastReport(value: MergeReport | undefined) { draft.lastMergeReport = value; },
+  };
+  try {
+    resolveConflict(store, conflictId, resolutions as Record<string, ConflictSide>);
+  } catch (error) {
+    receiptMessage = { tone: "error", text: error instanceof Error ? error.message : "裁决失败。" };
+    render();
+    return;
+  }
+
+  // 全部裁决完 → 收尾批次、生成新快照与最终回传回执。
+  const finished = completeBatchIfReady(store, (label) => appendMergedSnapshot(draft, label));
+  draft.updatedAt = new Date().toISOString();
+
+  // 落库成功后再换入内存态；失败则保留裁决前状态。
+  if (!writeStorage("裁决写入", draft)) {
+    receiptMessage = { tone: "error", text: "裁决结果写入本地存储失败，已保持裁决前状态，请重试。" };
+    render();
+    return;
+  }
+
+  undoStack = [...undoStack.slice(-49), structuredClone(project)];
+  redoStack = [];
+  project = draft;
+  document.documentElement.dataset.lastAction = "裁决回执冲突";
+  if (finished) {
+    receiptMessage = { tone: "success", text: `全部冲突已裁决，批次 ${finished.batchId} 完成，已生成新快照（${finished.snapshotId ?? ""}），请下载回传回执。` };
+  } else {
+    receiptMessage = { tone: "info", text: "已记录该条裁决，仍有其他并排冲突待处理。" };
+  }
+  render();
+}
+
+function downloadReturnReceipt() {
+  const report = project.lastMergeReport;
+  if (!report) return;
+  download(`${report.receiptId}-回传回执.json`, JSON.stringify(report, null, 2), "application/json;charset=utf-8");
+  receiptMessage = { tone: "success", text: `回传回执 ${report.receiptId}.json 已下载。` };
+  render();
+}
+
+function dismissStaleNotices() {
+  commit("确认检查已重算", (draft) => {
+    for (const notice of draft.staleCheckNotices ?? []) notice.acknowledged = true;
+  });
+}
+
 function render() {
   const list = issues();
   const active = activeBlock();
   const activeIssues = list.filter((issue) => issue.blockId === active.id);
   const approved = project.blocks.filter((block) => block.reviewStatus === "approved").length;
   const version = project.versions.find((item) => item.id === selectedVersionId) ?? project.versions[0];
+  const totalConflicts = pendingConflictCount();
+  const activeConflicts = conflictsForBlock(active.id);
+  const staleNotices = (project.staleCheckNotices ?? []).filter((notice) => !notice.acknowledged);
+  const exportBlocked = totalConflicts > 0;
 
   app.innerHTML = `
     <div class="app-shell">
@@ -480,8 +776,11 @@ function render() {
           <sl-button size="small" variant="default" ${undoStack.length ? "" : "disabled"} data-action="undo">撤销</sl-button>
           <sl-button size="small" variant="default" ${redoStack.length ? "" : "disabled"} data-action="redo">重做</sl-button>
           <sl-button size="small" variant="default" data-action="glossary">术语表</sl-button>
+          <sl-button size="small" variant="warning" outline data-action="receipts">回执对账${totalConflicts ? `<sl-badge variant="danger" pill>${totalConflicts}</sl-badge>` : ""}</sl-button>
           <sl-button size="small" variant="primary" data-action="save-version">保存版本</sl-button>
-          <sl-button size="small" variant="success" data-action="export">导出无障碍 HTML</sl-button>
+          <sl-tooltip content="${exportBlocked ? "回执冲突裁决完成前不能导出" : "导出完整无障碍 HTML"}">
+            <sl-button size="small" variant="success" ${exportBlocked ? "disabled" : ""} data-action="export">导出无障碍 HTML</sl-button>
+          </sl-tooltip>
         </div>
       </header>
 
@@ -495,17 +794,33 @@ function render() {
         </div>
       </div>
 
+      ${totalConflicts ? `<div class="conflict-banner" role="alert">
+        <b>回执对账有 ${totalConflicts} 处并排待裁</b>
+        <span>学校回执与本地稿修改了同一处内容。裁决完成前，相关内容块不能审核通过，全文也不能导出。</span>
+        <sl-button size="small" variant="warning" data-action="receipts">前往裁决</sl-button>
+      </div>` : ""}
+      ${staleNotices.length ? `<div class="stale-banner" role="status">
+        <b>术语已调整，${staleNotices.reduce((total, notice) => total + notice.blockIds.length, 0)} 项旧检查结果已失效</b>
+        <span>下列检查已按新术语表重算：${staleNotices.flatMap((notice) => notice.blockIds.map((blockId) => `#${project.blocks.findIndex((block) => block.id === blockId) + 1}`)).filter((position, index, arr) => position !== "0" && arr.indexOf(position) === index).slice(0, 8).join("、")} 块的术语一致性检查。<em>（旧结果已标记为失效）</em></span>
+        <sl-button size="small" variant="default" data-action="dismiss-stale">知道了</sl-button>
+      </div>` : ""}
+      ${receiptMessage ? `<div class="receipt-message ${receiptMessage.tone}" role="status">
+        <span>${escapeHtml(receiptMessage.text)}</span>
+        <button data-action="clear-receipt-message" aria-label="关闭提示">×</button>
+      </div>` : ""}
+
       <div class="workspace">
         <aside class="outline-panel">
           <div class="panel-title"><span>章节结构</span><sl-badge>${project.blocks.length} 块</sl-badge></div>
           <div class="block-list">
             ${project.blocks.map((block, index) => {
               const blockIssues = list.filter((issue) => issue.blockId === block.id);
+              const conflicted = blockHasConflict(block.id);
               return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
-                <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
+                <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}${conflicted ? ` · <em class="conflict-flag">待裁</em>` : ""}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
                 <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
-                ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
+                ${conflicted ? `<em class="conflict-dot" title="回执冲突待裁">!</em>` : blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
               </button>`;
             }).join("")}
           </div>
@@ -518,16 +833,26 @@ function render() {
           <div class="editor-head">
             <div><span class="eyebrow">当前内容块</span><h1>${blockRole(active)}</h1></div>
             <div class="review-actions">
-              <sl-button size="small" variant="${active.reviewStatus === "approved" ? "success" : "default"}" data-action="approve">${active.reviewStatus === "approved" ? "✓ 已通过" : "审核通过"}</sl-button>
+              <sl-tooltip content="${activeConflicts.length ? "该块有回执冲突，裁决完成前不能通过" : "审核通过"}">
+                <sl-button size="small" variant="${active.reviewStatus === "approved" ? "success" : "default"}" ${activeConflicts.length ? "disabled" : ""} data-action="approve">${active.reviewStatus === "approved" ? "✓ 已通过" : "审核通过"}</sl-button>
+              </sl-tooltip>
               <sl-button size="small" variant="${active.reviewStatus === "needs-work" ? "danger" : "default"}" data-action="needs-work">需修改</sl-button>
             </div>
           </div>
 
-          ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => `
+          ${activeConflicts.length ? `<div class="conflict-strip" role="alert">
+            <div><b>⚠ ${activeConflicts.length} 处回执冲突并排待裁</b><span>学校离线稿与本地稿都修改了这一块，按字段选择保留哪一侧后才能审核通过。</span></div>
+            <sl-button size="small" variant="warning" data-action="receipts">去裁决</sl-button>
+          </div>` : ""}
+
+          ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => {
+            const recomputed = staleNotices.some((notice) => notice.blockIds.includes(active.id) && issue.type === "glossary");
+            return `
             <div class="issue-card ${issue.severity}">
-              <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong></div>
+              <div><sl-badge variant="${issue.severity === "error" ? "danger" : issue.severity === "warning" ? "warning" : "primary"}">${severityLabel(issue.severity)}</sl-badge><strong>${escapeHtml(issue.title)}</strong>${recomputed ? `<sl-badge variant="neutral" class="recomputed-badge">术语调整后已重算（旧结果失效）</sl-badge>` : ""}</div>
               <p>${escapeHtml(issue.detail)}</p><small>${escapeHtml(issue.suggestion)}</small>
-            </div>`).join("")}</div>` : `<div class="issue-clear">✓ 当前内容块没有新的无障碍问题</div>`}
+            </div>`;
+          }).join("")}</div>` : `<div class="issue-clear">✓ 当前内容块没有新的无障碍问题${staleNotices.some((notice) => notice.blockIds.includes(active.id)) ? "（术语相关检查已按新术语表重算）" : ""}</div>`}
 
           <section class="edit-card source-card">
             <div class="section-heading"><div><span class="eyebrow">原教材</span><h2>${active.type === "image" ? "图片信息" : active.type === "link" ? "链接信息" : "原文"}</h2></div><sl-badge variant="neutral">${active.type}</sl-badge></div>
@@ -573,7 +898,7 @@ function render() {
           </section>
 
           <section class="issues-panel">
-            <div class="section-heading"><div><span class="eyebrow">All checks</span><h2>全章问题</h2></div><sl-button size="small" variant="default" outline data-action="approve-all">全部通过</sl-button></div>
+            <div class="section-heading"><div><span class="eyebrow">All checks</span><h2>全章问题</h2></div><sl-tooltip content="${exportBlocked ? "存在未裁决的回执冲突，不能批量通过" : "将所有内容块标记为已通过"}"><sl-button size="small" variant="default" outline ${exportBlocked ? "disabled" : ""} data-action="approve-all">全部通过</sl-button></sl-tooltip></div>
             <div class="issue-list">
               ${list.length ? list.map((issue) => `<button class="${issue.id === activeIssueId ? "active" : ""} ${issue.severity}" data-action="jump-issue" data-issue-id="${issue.id}" data-block-id="${issue.blockId}"><span>${severityLabel(issue.severity)}</span><b>${escapeHtml(issue.title)}</b><small>段 ${project.blocks.findIndex((block) => block.id === issue.blockId) + 1} · ${escapeHtml(issue.suggestion)}</small></button>`).join("") : `<div class="issue-clear">✓ 全章检查通过</div>`}
             </div>
@@ -598,9 +923,113 @@ function render() {
       </div>
       <div class="term-add"><sl-input id="new-term-source" placeholder="原文术语"></sl-input><sl-input id="new-term-preferred" placeholder="统一表达"></sl-input><sl-button variant="primary" data-action="add-term">添加术语</sl-button></div>
       <sl-button slot="footer" variant="primary" data-action="close-glossary">完成</sl-button>
-    </sl-dialog>`;
+    </sl-dialog>
+    ${renderReceiptsDialog()}`;
 
   wireLiveFields();
+}
+
+function fieldDisplay(value: string | number, field: RectField) {
+  if (field === "reviewStatus") return statusLabel(value as ReviewStatus);
+  if (field === "headingLevel") return `H${value}`;
+  return String(value || "（空）");
+}
+
+function renderConflictPanel(conflict: PendingConflict) {
+  const block = project.blocks.find((item) => item.id === conflict.blockId);
+  const position = project.blocks.findIndex((item) => item.id === conflict.blockId) + 1;
+  return `<article class="conflict-card">
+    <header>
+      <div><b>第 ${position} 块 · ${block ? blockRole(block) : "内容块已删除"}</b><span>批注号 ${escapeHtml(conflict.annotationId)} · 定位方式：${conflict.matchedBy === "block-id" ? "块标识" : "摘录与邻块"}</span></div>
+      <sl-badge variant="danger">待裁 ${conflict.conflicts.length} 项</sl-badge>
+    </header>
+    ${conflict.conflicts.map((fieldConflict) => `
+      <div class="conflict-field">
+        <div class="conflict-field-head"><b>${FIELD_LABELS[fieldConflict.field]}</b>${fieldConflict.base !== undefined ? `<small>离线底稿：${escapeHtml(fieldDisplay(fieldConflict.base, fieldConflict.field))}</small>` : `<small>回执未提供底稿，按仅远端改动处理</small>`}</div>
+        <div class="conflict-sides">
+          <label class="conflict-side local">
+            <input type="radio" name="${conflict.id}-${fieldConflict.field}" value="local" checked />
+            <div><span>本地稿${!sameFieldHelper(fieldConflict.local, fieldConflict.base) ? "（已改）" : ""}</span><p>${escapeHtml(fieldDisplay(fieldConflict.local, fieldConflict.field))}</p></div>
+          </label>
+          <label class="conflict-side receipt">
+            <input type="radio" name="${conflict.id}-${fieldConflict.field}" value="receipt" />
+            <div><span>学校回执</span><p>${escapeHtml(fieldDisplay(fieldConflict.receipt, fieldConflict.field))}</p></div>
+          </label>
+        </div>
+      </div>`).join("")}
+    <div class="conflict-actions">
+      <sl-button size="small" variant="default" data-action="conflict-pick-all" data-conflict-id="${conflict.id}" data-side="local">全选本地</sl-button>
+      <sl-button size="small" variant="default" data-action="conflict-pick-all" data-conflict-id="${conflict.id}" data-side="receipt">全选回执</sl-button>
+      <sl-button size="small" variant="primary" data-action="resolve-conflict" data-conflict-id="${conflict.id}">按所选裁决</sl-button>
+    </div>
+  </article>`;
+}
+
+function sameFieldHelper(a: unknown, b: unknown) {
+  if (a === b) return true;
+  if (typeof a === "string" && typeof b === "string") return a.replace(/\s+/g, "") === b.replace(/\s+/g, "");
+  return false;
+}
+
+function renderReceiptsDialog() {
+  const report = project.lastMergeReport;
+  const conflicts = (project.pendingConflicts ?? []).filter((conflict) => !conflict.resolved);
+  const batches = project.mergeBatches ?? [];
+  return `
+    <sl-dialog label="离线回执对账" class="receipt-dialog" ${showReceipts ? "open" : ""} data-dialog="receipts">
+      <div class="receipt-dialog-body">
+        <section class="receipt-import-card">
+          <div class="section-heading"><div><span class="eyebrow">Import receipt</span><h2>导入学校结构化回执</h2></div></div>
+          <p class="receipt-hint">先按块标识认块；块被拆分或移动时，再按摘录与邻块定位。只有一侧变化自动合入，两边都改过会进入下方并排待裁。</p>
+          <sl-textarea id="receipt-input" rows="6" placeholder='{"receiptId":"RCV-…","school":"…","annotations":[…]}'></sl-textarea>
+          <div class="receipt-import-actions">
+            <sl-button size="small" variant="default" data-action="load-sample-receipt">载入示例回执</sl-button>
+            <sl-button size="small" variant="default" outline data-action="simulate-fail-receipt">模拟写入失败（验证回滚）</sl-button>
+            <sl-button size="small" variant="primary" data-action="apply-receipt">解析并对账合入</sl-button>
+            <input id="receipt-file" type="file" accept=".json,application/json" hidden />
+            <sl-button size="small" variant="default" data-action="pick-receipt-file">选择回执文件</sl-button>
+          </div>
+        </section>
+
+        ${conflicts.length ? `<section class="conflict-arbitration">
+          <div class="section-heading"><div><span class="eyebrow">Arbitration</span><h2>并排待裁（${conflicts.length} 处）</h2></div><sl-badge variant="danger">未裁决前不能通过/导出</sl-badge></div>
+          <div class="conflict-list">${conflicts.map(renderConflictPanel).join("")}</div>
+        </section>` : ""}
+
+        ${report ? `<section class="report-card">
+          <div class="section-heading">
+            <div><span class="eyebrow">Return receipt</span><h2>回传回执 · ${escapeHtml(report.receiptId)}</h2></div>
+            <sl-badge variant="${report.status === "completed" ? "success" : "warning"}">${report.status === "completed" ? "合批完成" : "待裁决"}</sl-badge>
+          </div>
+          <div class="report-meta">
+            <span>学校：${escapeHtml(report.school)}</span>
+            <span>合入：${new Date(report.mergedAt).toLocaleString()}</span>
+            ${report.finishedAt ? `<span>收尾：${new Date(report.finishedAt).toLocaleString()}</span>` : ""}
+            ${report.snapshotId ? `<span>新快照：${escapeHtml(report.snapshotId)}</span>` : ""}
+          </div>
+          <div class="report-items">
+            ${report.items.map((item) => {
+              const tone = outcomeLabel(item.outcome);
+              return `<div class="report-item ${tone.tone}">
+                <span class="report-outcome">${tone.label}</span>
+                <div><b>${escapeHtml(item.annotationId)}</b><small>${item.matchedBy ? `定位：${item.matchedBy === "block-id" ? "块标识" : "摘录邻块"}${item.matchedBlockId ? ` → ${escapeHtml(item.matchedBlockId)}` : ""}` : escapeHtml(item.blockId ?? "")}</small><p>${escapeHtml(item.detail)}</p></div>
+              </div>`;
+            }).join("")}
+          </div>
+          ${report.glossaryApplied.length ? `<div class="report-glossary"><b>术语调整（相关检查已重算，旧结果失效）</b>${report.glossaryApplied.map((change: ReceiptGlossaryChange) => `<span>${change.action === "add" ? "新增" : change.action === "remove" ? "删除" : "改首选词"}：${escapeHtml(change.source ?? change.termId ?? "")}${change.preferred ? ` → ${escapeHtml(change.preferred)}` : ""}</span>`).join("")}</div>` : ""}
+          <div class="report-actions">
+            <sl-button size="small" variant="${report.status === "completed" ? "success" : "default"}" ${report.status === "completed" ? "" : "disabled"} data-action="download-report">下载回传回执 JSON</sl-button>
+            ${report.status === "completed" ? "" : `<small>全部冲突裁决后批次收尾，届时可下载最终回执。</small>`}
+          </div>
+        </section>` : ""}
+
+        ${batches.length ? `<section class="batch-history">
+          <div class="section-heading"><span class="eyebrow">Batch history</span></div>
+          ${batches.map((batch) => `<div class="batch-row"><b>${escapeHtml(batch.receiptId)}</b><span>${batch.annotationIds.length} 条 · ${new Date(batch.mergedAt).toLocaleString()}</span><sl-badge variant="${batch.status === "completed" ? "success" : "warning"}">${batch.status === "completed" ? "已完成" : "待裁决"}</sl-badge></div>`).join("")}
+        </section>` : ""}
+      </div>
+      <sl-button slot="footer" variant="primary" data-action="close-receipts">完成</sl-button>
+    </sl-dialog>`;
 }
 
 function renderSourceEditor(block: ContentBlock) {
@@ -701,7 +1130,10 @@ app.addEventListener("click", (event) => {
       current.reviewStatus = "pending";
     }, "生成易读版本");
   }
-  if (action === "approve") updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
+  if (action === "approve") {
+    if (blockHasConflict(activeBlock().id)) return; // 未裁决前不能通过
+    updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
+  }
   if (action === "needs-work") updateActiveBlock((block) => { block.reviewStatus = "needs-work"; }, "标记需修改");
   if (action === "add-comment") {
     const input = app.querySelector<HTMLElement & { value: string }>("#new-comment");
@@ -729,16 +1161,61 @@ app.addEventListener("click", (event) => {
   if (action === "preview-assisted") { previewMode = "assisted"; render(); }
   if (action === "glossary") { showGlossary = true; render(); }
   if (action === "close-glossary") { showGlossary = false; render(); }
+  if (action === "receipts") { showReceipts = true; receiptMessage = null; render(); }
+  if (action === "close-receipts") { showReceipts = false; render(); }
+  if (action === "clear-receipt-message") { receiptMessage = null; render(); }
+  if (action === "dismiss-stale") dismissStaleNotices();
+  if (action === "load-sample-receipt") {
+    const input = app.querySelector<HTMLElement & { value: string }>("#receipt-input");
+    if (input) input.value = JSON.stringify(createSampleReceipt(), null, 2);
+  }
+  if (action === "pick-receipt-file") app.querySelector<HTMLInputElement>("#receipt-file")?.click();
+  if (action === "apply-receipt") {
+    const input = app.querySelector<HTMLElement & { value: string }>("#receipt-input");
+    if (input?.value.trim()) importReceiptText(input.value);
+  }
+  if (action === "simulate-fail-receipt") {
+    const input = app.querySelector<HTMLElement & { value: string }>("#receipt-input");
+    const raw = input?.value.trim() || JSON.stringify(createSampleReceipt());
+    importReceiptText(raw, true);
+  }
+  if (action === "resolve-conflict") {
+    const conflictId = target.dataset.conflictId ?? "";
+    const conflict = (project.pendingConflicts ?? []).find((item) => item.id === conflictId);
+    if (!conflict) return;
+    const resolutions = {} as Record<RectField, ConflictSide | "">;
+    for (const fieldConflict of conflict.conflicts) {
+      const checked = app.querySelector<HTMLInputElement>(`input[name="${conflictId}-${fieldConflict.field}"]:checked`);
+      resolutions[fieldConflict.field] = (checked?.value as ConflictSide) ?? "";
+    }
+    arbitrateConflict(conflictId, resolutions);
+  }
+  if (action === "conflict-pick-all") {
+    const conflictId = target.dataset.conflictId ?? "";
+    const side = (target.dataset.side ?? "local") as ConflictSide;
+    app.querySelectorAll<HTMLInputElement>(`input[name^="${conflictId}-"]`).forEach((radio) => {
+      if (radio.value === side) radio.checked = true;
+    });
+  }
+  if (action === "download-report") downloadReturnReceipt();
   if (action === "add-term") {
     const source = app.querySelector<HTMLElement & { value: string }>("#new-term-source");
     const preferred = app.querySelector<HTMLElement & { value: string }>("#new-term-preferred");
     if (source?.value.trim() && preferred?.value.trim()) {
-      commit("添加术语", (draft) => { draft.glossary.push({ id: uid("term"), source: source.value.trim(), preferred: preferred.value.trim(), note: "编辑新增术语" }); });
+      commit("添加术语", (draft) => {
+        const term = { id: uid("term"), source: source.value.trim(), preferred: preferred.value.trim(), note: "编辑新增术语" };
+        draft.glossary.push(term);
+        invalidateGlossaryChecks(draft, term);
+      });
     }
   }
   if (action === "remove-term") {
     const termId = target.dataset.termId;
-    commit("删除术语", (draft) => { draft.glossary = draft.glossary.filter((term) => term.id !== termId); });
+    commit("删除术语", (draft) => {
+      const term = draft.glossary.find((item) => item.id === termId);
+      if (term) invalidateGlossaryChecks(draft, term);
+      draft.glossary = draft.glossary.filter((term) => term.id !== termId);
+    });
   }
   if (action === "save-version") {
     const versionId = uid("version");
@@ -750,9 +1227,16 @@ app.addEventListener("click", (event) => {
     render();
   }
   if (action === "approve-all") {
+    if (hasPendingConflictsGlobal()) return;
     commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
   }
   if (action === "export") {
+    if (hasPendingConflictsGlobal()) {
+      showReceipts = true;
+      receiptMessage = { tone: "error", text: "仍有回执冲突未裁决，未裁决前不能导出无障碍 HTML。" };
+      render();
+      return;
+    }
     download(`${project.title}-无障碍版.html`, exportHtml(project));
     document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
     render();
@@ -774,20 +1258,34 @@ app.addEventListener("sl-change", (event) => {
   if (element.matches("[data-term-id]")) {
     const termId = element.dataset.termId;
     const value = (element as HTMLElement & { value: string }).value;
-    commit("修改术语表", (draft) => { const term = draft.glossary.find((item) => item.id === termId); if (term) term.preferred = value; });
+    commit("修改术语表", (draft) => {
+      const term = draft.glossary.find((item) => item.id === termId);
+      if (term && term.preferred !== value) {
+        term.preferred = value;
+        invalidateGlossaryChecks(draft, term);
+      }
+    });
   }
 });
 
 app.addEventListener("change", (event) => {
   const input = event.target as HTMLInputElement;
-  if (input.id !== "chapter-file" || !input.files?.[0]) return;
-  void input.files[0].text().then((text) => {
-    commit("导入章节文本", (draft) => {
-      draft.blocks = parseImportedChapter(text);
-      activeBlockId = draft.blocks[0]?.id ?? "";
-      activeIssueId = "";
+  if (input.id === "chapter-file" && input.files?.[0]) {
+    void input.files[0].text().then((text) => {
+      commit("导入章节文本", (draft) => {
+        draft.blocks = parseImportedChapter(text);
+        activeBlockId = draft.blocks[0]?.id ?? "";
+        activeIssueId = "";
+      });
     });
-  });
+    return;
+  }
+  if (input.id === "receipt-file" && input.files?.[0]) {
+    void input.files[0].text().then((text) => {
+      const target = app.querySelector<HTMLElement & { value: string }>("#receipt-input");
+      if (target) target.value = text;
+    });
+  }
 });
 
 app.addEventListener("input", (event) => {

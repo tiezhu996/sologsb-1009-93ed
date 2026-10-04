@@ -7,6 +7,7 @@
     "dev": "astro dev",
     "build": "astro check && astro build",
     "check": "astro check",
+    "test": "node --experimental-strip-types --no-warnings test/reconcile.test.ts",
     "preview": "astro preview"
   },
   "dependencies": {

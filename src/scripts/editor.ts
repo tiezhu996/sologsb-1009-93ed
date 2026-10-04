@@ -49,6 +49,78 @@ interface VersionSnapshot {
   glossary: GlossaryTerm[];
 }
 
+interface MergeConflict {
+  id: string;
+  blockId: string;
+  receiptId: string;
+  createdAt: string;
+  localText: string;
+  remoteText: string;
+  localStatus: ReviewStatus;
+  remoteStatus?: ReviewStatus;
+  note: string;
+}
+
+interface CheckRun {
+  revision: number;
+  at: string;
+  total: number;
+  errors: number;
+  warnings: number;
+  infos: number;
+  stale: boolean;
+}
+
+interface ReceiptComment {
+  id?: string;
+  author?: string;
+  body?: string;
+  createdAt?: string;
+  resolved?: boolean;
+  replies?: { id?: string; author?: string; body?: string; createdAt?: string }[];
+}
+
+interface ReceiptEntry {
+  blockId?: string;
+  excerpt?: string;
+  prevBlockId?: string;
+  nextBlockId?: string;
+  prevExcerpt?: string;
+  nextExcerpt?: string;
+  baseAccessibleText?: string;
+  baseStatus?: ReviewStatus;
+  accessibleText?: string;
+  reviewStatus?: ReviewStatus;
+  changeReason?: string;
+  comments?: ReceiptComment[];
+}
+
+interface ReviewReceipt {
+  schema: string;
+  receiptId: string;
+  createdAt?: string;
+  glossary?: { id?: string; source: string; preferred: string; note?: string }[];
+  entries: ReceiptEntry[];
+}
+
+interface MergeResult {
+  blockId: string;
+  match: "id" | "excerpt" | "excerpt-neighbors" | "split" | "unmatched";
+  resolution: "applied-remote" | "kept-local" | "conflict" | "comments-only" | "no-change" | "unmatched";
+  detail: string;
+}
+
+interface ReturnReceipt {
+  schema: "review-receipt-return/1";
+  receiptId: string;
+  mergedAt: string;
+  snapshotId: string;
+  projectTitle: string;
+  glossaryRevision: number;
+  openConflicts: number;
+  results: MergeResult[];
+}
+
 interface ChapterProject {
   id: string;
   title: string;
@@ -58,6 +130,12 @@ interface ChapterProject {
   glossary: GlossaryTerm[];
   versions: VersionSnapshot[];
   updatedAt: string;
+  glossaryRevision: number;
+  lastCheck?: CheckRun;
+  staleCheck?: CheckRun;
+  mergeConflicts: MergeConflict[];
+  appliedReceipts: string[];
+  returnReceipts: Record<string, ReturnReceipt>;
 }
 
 interface AccessibilityIssue {
@@ -168,6 +246,10 @@ function createSeedProject(): ChapterProject {
     ],
     versions: [],
     updatedAt: new Date().toISOString(),
+    glossaryRevision: 1,
+    mergeConflicts: [],
+    appliedReceipts: [],
+    returnReceipts: {},
   };
 }
 
@@ -327,6 +409,296 @@ function blockRole(block: ContentBlock) {
   return "正文段落";
 }
 
+/* ---------- 离线回执对账 ---------- */
+
+function normText(value: string) {
+  return value.replace(/[\s，。！？、；：""''（）《》〈〉…—·,.!?;:()\[\]<>\-]/g, "");
+}
+
+function persistNow() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project }));
+}
+
+const openConflicts = () => project.mergeConflicts;
+const blockConflict = (blockId: string) => project.mergeConflicts.find((conflict) => conflict.blockId === blockId);
+
+function refreshChecks() {
+  const list = analyze(project);
+  project.lastCheck = {
+    revision: project.glossaryRevision,
+    at: new Date().toISOString(),
+    total: list.length,
+    errors: list.filter((issue) => issue.severity === "error").length,
+    warnings: list.filter((issue) => issue.severity === "warning").length,
+    infos: list.filter((issue) => issue.severity === "info").length,
+    stale: false,
+  };
+}
+
+function bumpGlossaryRevision(draft: ChapterProject) {
+  draft.glossaryRevision += 1;
+  if (draft.lastCheck) draft.staleCheck = { ...draft.lastCheck, stale: true };
+}
+
+/** 先认块标识；块被拆分或移动后，退而按摘录与邻块定位。 */
+function locateByJoin(blocks: ContentBlock[], texts: string[], excerpt: string) {
+  for (let start = 0; start < blocks.length; start++) {
+    let joined = "";
+    for (let end = start; end < Math.min(blocks.length, start + 6); end++) {
+      joined += texts[end];
+      if (joined.includes(excerpt)) return blocks[start];
+      if (joined.length > excerpt.length + 60) break;
+    }
+  }
+  return null;
+}
+
+function locateEntry(blocks: ContentBlock[], entry: ReceiptEntry): { block: ContentBlock; via: MergeResult["match"] } | null {
+  if (entry.blockId) {
+    const byId = blocks.find((block) => block.id === entry.blockId);
+    if (byId) return { block: byId, via: "id" };
+  }
+  const excerpt = normText(entry.excerpt ?? "");
+  if (excerpt.length < 4) return null;
+  const texts = blocks.map((block) => normText(block.accessibleText || block.text));
+  const candidates = blocks
+    .map((block, index) => ({ block, index }))
+    .filter(({ index }) => texts[index].includes(excerpt) || (texts[index].length >= 4 && excerpt.includes(texts[index])));
+  if (!candidates.length) {
+    // 本地可能把回执对应的一段拆成了多个连续块，尝试拼接定位。
+    const joined = locateByJoin(blocks, texts, excerpt);
+    return joined ? { block: joined, via: "split" } : null;
+  }
+  if (candidates.length === 1) return { block: candidates[0].block, via: "excerpt" };
+  let best: { block: ContentBlock; via: MergeResult["match"] } | null = null;
+  let bestScore = 0;
+  for (const { block, index } of candidates) {
+    let score = 0;
+    if (entry.prevBlockId && blocks[index - 1]?.id === entry.prevBlockId) score += 2;
+    if (entry.nextBlockId && blocks[index + 1]?.id === entry.nextBlockId) score += 2;
+    if (entry.prevExcerpt && texts[index - 1]?.includes(normText(entry.prevExcerpt))) score += 1;
+    if (entry.nextExcerpt && texts[index + 1]?.includes(normText(entry.nextExcerpt))) score += 1;
+    if (score > bestScore) {
+      best = { block, via: "excerpt-neighbors" };
+      bestScore = score;
+    }
+  }
+  if (best) return best;
+  // 多个候选且邻块信息不足：摘录若横跨连续块，按拆分定位到首块。
+  const joined = locateByJoin(blocks, texts, excerpt);
+  return joined ? { block: joined, via: "split" } : null;
+}
+
+function mergeReceiptComments(block: ContentBlock, incoming: ReceiptComment[] | undefined) {
+  let added = 0;
+  for (const remote of incoming ?? []) {
+    if (!remote.body?.trim()) continue;
+    const existing = remote.id ? block.comments.find((comment) => comment.id === remote.id) : undefined;
+    if (existing) {
+      for (const reply of remote.replies ?? []) {
+        if (reply.body?.trim() && !existing.replies.some((item) => item.id === reply.id)) {
+          existing.replies.push({ id: reply.id ?? uid("reply"), author: reply.author ?? "学校回执", body: reply.body, createdAt: reply.createdAt ?? new Date().toISOString() });
+        }
+      }
+      if (typeof remote.resolved === "boolean") existing.resolved = remote.resolved;
+      continue;
+    }
+    block.comments.push({
+      id: remote.id ?? uid("comment"),
+      author: remote.author ?? "学校回执",
+      body: remote.body,
+      createdAt: remote.createdAt ?? new Date().toISOString(),
+      resolved: remote.resolved ?? false,
+      replies: (remote.replies ?? [])
+        .filter((reply) => reply.body?.trim())
+        .map((reply) => ({ id: reply.id ?? uid("reply"), author: reply.author ?? "学校回执", body: reply.body ?? "", createdAt: reply.createdAt ?? new Date().toISOString() })),
+    });
+    added++;
+  }
+  return added;
+}
+
+/** 只有一侧变化就合入；两边都改过则登记并排待裁。 */
+function mergeReceiptInto(draft: ChapterProject, receipt: ReviewReceipt) {
+  const results: MergeResult[] = [];
+  let glossaryChanged = false;
+  for (const term of receipt.glossary ?? []) {
+    if (!term.source?.trim() || !term.preferred?.trim()) continue;
+    const existing = draft.glossary.find((item) => item.source === term.source.trim());
+    if (existing) {
+      if (existing.preferred !== term.preferred.trim()) {
+        existing.preferred = term.preferred.trim();
+        if (term.note) existing.note = term.note;
+        glossaryChanged = true;
+      }
+    } else {
+      draft.glossary.push({ id: term.id ?? uid("term"), source: term.source.trim(), preferred: term.preferred.trim(), note: term.note ?? "回执同步术语" });
+      glossaryChanged = true;
+    }
+  }
+  if (glossaryChanged) bumpGlossaryRevision(draft);
+
+  for (const entry of receipt.entries) {
+    const located = locateEntry(draft.blocks, entry);
+    if (!located) {
+      results.push({ blockId: entry.blockId ?? "", match: "unmatched", resolution: "unmatched", detail: "未能在本地定位该内容块，已跳过并记入回传回执。" });
+      continue;
+    }
+    const { block, via } = located;
+    const addedComments = mergeReceiptComments(block, entry.comments);
+
+    const base = entry.baseAccessibleText;
+    const remoteText = typeof entry.accessibleText === "string" ? entry.accessibleText : undefined;
+    const remoteChanged = remoteText !== undefined && (base === undefined || normText(remoteText) !== normText(base));
+    const localChanged = base !== undefined && normText(block.accessibleText) !== normText(base);
+    const matchNote = via === "id" ? "" : via === "split" ? "（本地已拆分，按连续块拼接定位）" : via === "excerpt-neighbors" ? "（按摘录与邻块定位）" : "（按摘录定位）";
+
+    if (remoteChanged && !localChanged) {
+      block.accessibleText = remoteText;
+      if (block.type === "image") block.imageAlt = remoteText;
+      if (entry.changeReason) block.changeReason = entry.changeReason;
+      if (entry.reviewStatus) block.reviewStatus = entry.reviewStatus;
+      results.push({ blockId: block.id, match: via, resolution: "applied-remote", detail: `仅回执侧修改，已合入${matchNote}。` });
+      continue;
+    }
+    if (remoteChanged && localChanged && normText(remoteText) !== normText(block.accessibleText)) {
+      draft.mergeConflicts.push({
+        id: uid("conflict"),
+        blockId: block.id,
+        receiptId: receipt.receiptId,
+        createdAt: new Date().toISOString(),
+        localText: block.accessibleText,
+        remoteText,
+        localStatus: block.reviewStatus,
+        remoteStatus: entry.reviewStatus,
+        note: entry.changeReason ?? "本地稿与学校回执都修改了该块",
+      });
+      results.push({ blockId: block.id, match: via, resolution: "conflict", detail: `两侧都修改过，已并排待裁${matchNote}。` });
+      continue;
+    }
+    if (entry.reviewStatus && (!entry.baseStatus || block.reviewStatus === entry.baseStatus)) block.reviewStatus = entry.reviewStatus;
+    const kept = remoteText !== undefined && normText(remoteText) !== normText(block.accessibleText);
+    results.push({
+      blockId: block.id,
+      match: via,
+      resolution: addedComments ? "comments-only" : kept ? "kept-local" : "no-change",
+      detail: addedComments ? `合入 ${addedComments} 条批注，文本以本地为准。` : kept ? "仅本地修改过，保留本地文本。" : "两侧一致，无需变更。",
+    });
+  }
+
+  const snapshotId = uid("version");
+  draft.versions.unshift({ id: snapshotId, label: `合批回执 ${receipt.receiptId}`, createdAt: new Date().toISOString(), blocks: structuredClone(draft.blocks), glossary: structuredClone(draft.glossary) });
+  draft.versions = draft.versions.slice(0, 10);
+  draft.appliedReceipts.push(receipt.receiptId);
+  return { results, snapshotId };
+}
+
+function setLastAction(message: string) {
+  document.documentElement.dataset.lastAction = message;
+}
+
+/** 事务化合批：写入失败恢复合并前状态；同一回执重试不重复增加批注和版本。 */
+function applyReceipt(receipt: ReviewReceipt) {
+  if (!receipt || receipt.schema !== "review-receipt/1" || !receipt.receiptId || !Array.isArray(receipt.entries)) {
+    setLastAction("回执格式无法识别，未做任何修改。");
+    render();
+    return;
+  }
+  const existing = project.returnReceipts[receipt.receiptId];
+  if (project.appliedReceipts.includes(receipt.receiptId) && existing) {
+    setLastAction(`回执 ${receipt.receiptId} 已合入过，未重复添加批注或版本，重新下载回传回执。`);
+    download(`回传回执-${receipt.receiptId}.json`, JSON.stringify(existing, null, 2), "application/json;charset=utf-8");
+    render();
+    return;
+  }
+  const before = structuredClone(project);
+  const undoBefore = undoStack;
+  let returnReceipt: ReturnReceipt;
+  try {
+    const draft = structuredClone(project);
+    const { results, snapshotId } = mergeReceiptInto(draft, receipt);
+    draft.updatedAt = new Date().toISOString();
+    project = draft;
+    refreshChecks();
+    returnReceipt = {
+      schema: "review-receipt-return/1",
+      receiptId: receipt.receiptId,
+      mergedAt: new Date().toISOString(),
+      snapshotId,
+      projectTitle: project.title,
+      glossaryRevision: project.glossaryRevision,
+      openConflicts: project.mergeConflicts.length,
+      results,
+    };
+    project.returnReceipts[receipt.receiptId] = returnReceipt;
+    persistNow();
+    undoStack = [...undoStack.slice(-49), before];
+    redoStack = [];
+  } catch {
+    project = before;
+    undoStack = undoBefore;
+    try {
+      persistNow();
+    } catch {
+      // 恢复写入也失败时，内存状态已回滚，等待下一次自动保存。
+    }
+    setLastAction("写入失败，已恢复合并前状态，可重新导入回执重试。");
+    render();
+    return;
+  }
+  const conflicts = returnReceipt.results.filter((result) => result.resolution === "conflict").length;
+  const unmatched = returnReceipt.results.filter((result) => result.resolution === "unmatched").length;
+  setLastAction(`回执合批完成：快照 ${returnReceipt.snapshotId.slice(-8)}，${conflicts} 处待裁，${unmatched} 处未定位。`);
+  download(`回传回执-${receipt.receiptId}.json`, JSON.stringify(returnReceipt, null, 2), "application/json;charset=utf-8");
+  render();
+}
+
+function parseReceipt(text: string): ReviewReceipt | null {
+  try {
+    const parsed = JSON.parse(text) as ReviewReceipt;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildDemoReceipt(): ReviewReceipt {
+  const now = new Date().toISOString();
+  return {
+    schema: "review-receipt/1",
+    receiptId: `receipt-demo-${Date.now().toString(36)}`,
+    createdAt: now,
+    glossary: [
+      { source: "地表径流", preferred: "沿地面流动的水", note: "学校回执确认维持通俗表述" },
+      { source: "水蒸气", preferred: "水蒸气", note: "回执新增：全书统一写法" },
+    ],
+    entries: [
+      {
+        blockId: "block-p1",
+        baseAccessibleText: "城市里的水会不断循环。它经过蒸发、降水并沿地面流动。了解这些过程，可以帮助我们建设更能适应变化的城市。",
+        accessibleText: "城市里的水会不断循环。它经过蒸发、降水，并沿着地面流动。了解水循环，能让城市更好地应对暴雨和干旱。",
+        reviewStatus: "approved",
+        changeReason: "学校审读：结尾点出价值，句子保持简短。",
+        comments: [{ id: "demo-c1", author: "学校教研组", body: "结尾一句建议点出“应对暴雨和干旱”，学生更容易理解为什么要学。", createdAt: now, resolved: false, replies: [] }],
+      },
+      {
+        excerpt: "雨水花园用土壤和植物暂时存住雨水",
+        prevExcerpt: "雨水花园怎样工作",
+        reviewStatus: "approved",
+        comments: [{ id: "demo-c2", author: "学校教研组", body: "这一段的拆分很好，课堂上试读顺利，建议保留。", createdAt: now, resolved: false, replies: [] }],
+      },
+      {
+        blockId: "block-p2",
+        baseAccessibleText: "太阳照在水面上，水会变成水蒸气。",
+        accessibleText: "太阳晒到水面，水变成水蒸气升到空中。水蒸气变冷后形成云，再以雨或雪落回地面。",
+        reviewStatus: "needs-work",
+        changeReason: "学校建议把“照射”改为“晒”，请编辑室确认是否保留“形成云”。",
+        comments: [{ id: "demo-c3", author: "学校教研组", body: "“晒”更口语，但“形成云”是否保留请编辑室定夺。", createdAt: now, resolved: false, replies: [] }],
+      },
+    ],
+  };
+}
+
 function statusLabel(status: ReviewStatus) {
   if (status === "approved") return "已通过";
   if (status === "needs-work") return "需修改";
@@ -388,10 +760,20 @@ function download(filename: string, content: string, type = "text/html;charset=u
   URL.revokeObjectURL(url);
 }
 
+function normalizeProject(loaded: ChapterProject): ChapterProject {
+  loaded.glossaryRevision ??= 1;
+  loaded.mergeConflicts ??= [];
+  loaded.appliedReceipts ??= [];
+  loaded.returnReceipts ??= {};
+  loaded.versions ??= [];
+  loaded.glossary ??= [];
+  return loaded;
+}
+
 function loadProject(): ChapterProject {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: ChapterProject };
-    if (stored.schema === 1 && stored.project?.blocks?.length) return stored.project;
+    if (stored.schema === 1 && stored.project?.blocks?.length) return normalizeProject(stored.project);
   } catch {
     // Fall back to the bundled sample.
   }
@@ -466,6 +848,8 @@ function render() {
   const activeIssues = list.filter((issue) => issue.blockId === active.id);
   const approved = project.blocks.filter((block) => block.reviewStatus === "approved").length;
   const version = project.versions.find((item) => item.id === selectedVersionId) ?? project.versions[0];
+  const conflicts = openConflicts();
+  const activeConflict = blockConflict(active.id);
 
   app.innerHTML = `
     <div class="app-shell">
@@ -480,8 +864,10 @@ function render() {
           <sl-button size="small" variant="default" ${undoStack.length ? "" : "disabled"} data-action="undo">撤销</sl-button>
           <sl-button size="small" variant="default" ${redoStack.length ? "" : "disabled"} data-action="redo">重做</sl-button>
           <sl-button size="small" variant="default" data-action="glossary">术语表</sl-button>
+          <sl-button size="small" variant="default" data-action="import-receipt">导入回执</sl-button>
+          <sl-button size="small" variant="default" data-action="demo-receipt">演示回执</sl-button>
           <sl-button size="small" variant="primary" data-action="save-version">保存版本</sl-button>
-          <sl-button size="small" variant="success" data-action="export">导出无障碍 HTML</sl-button>
+          <sl-button size="small" variant="success" data-action="export" ${conflicts.length ? "disabled" : ""} title="${conflicts.length ? "存在未裁决的回执冲突，裁决前不能导出" : "导出无障碍 HTML"}">导出无障碍 HTML</sl-button>
         </div>
       </header>
 
@@ -492,6 +878,11 @@ function render() {
           <span class="error">${list.filter((issue) => issue.severity === "error").length} 必须修复</span>
           <span class="warning">${list.filter((issue) => issue.severity === "warning").length} 建议优化</span>
           <span class="info">${list.filter((issue) => issue.severity === "info").length} 术语提醒</span>
+          ${conflicts.length ? `<span class="conflict-count">${conflicts.length} 待裁决</span>` : ""}
+        </div>
+        <div class="check-status">
+          <span>检查基于术语 v${project.glossaryRevision}${project.lastCheck ? ` · 重算于 ${new Date(project.lastCheck.at).toLocaleTimeString()}，${project.lastCheck.total} 项` : ""}</span>
+          ${project.staleCheck?.stale ? `<span class="stale-note">旧结果（术语 v${project.staleCheck.revision}，${project.staleCheck.total} 项）已失效</span>` : ""}
         </div>
       </div>
 
@@ -501,15 +892,17 @@ function render() {
           <div class="block-list">
             ${project.blocks.map((block, index) => {
               const blockIssues = list.filter((issue) => issue.blockId === block.id);
-              return `<button class="block-item ${block.id === active.id ? "active" : ""}" data-action="select-block" data-block-id="${block.id}">
+              const conflicted = Boolean(blockConflict(block.id));
+              return `<button class="block-item ${block.id === active.id ? "active" : ""} ${conflicted ? "conflicted" : ""}" data-action="select-block" data-block-id="${block.id}">
                 <span class="block-order">${index + 1}</span>
                 <span class="block-copy"><b>${block.type === "heading" ? `H${block.headingLevel}` : blockRole(block)}</b><span>${escapeHtml(block.accessibleText || block.text || "（空）")}</span></span>
                 <i class="status-${block.reviewStatus}" title="${statusLabel(block.reviewStatus)}"></i>
-                ${blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
+                ${conflicted ? `<em class="conflict-flag" title="存在待裁决的回执冲突">裁</em>` : blockIssues.length ? `<em>${blockIssues.length}</em>` : ""}
               </button>`;
             }).join("")}
           </div>
           <input id="chapter-file" type="file" accept=".txt,.md,.markdown" hidden />
+          <input id="receipt-file" type="file" accept=".json,application/json" hidden />
           <sl-button class="import-button" variant="default" data-action="import">导入章节文本</sl-button>
           <div class="keyboard-note"><b>键盘</b><span><kbd>J</kbd><kbd>K</kbd> 跳转问题</span><span><kbd>E</kbd> 自动改写</span><span><kbd>⌘ Z</kbd> 撤销</span><span><kbd>1</kbd><kbd>2</kbd> 预览模式</span></div>
         </aside>
@@ -518,10 +911,36 @@ function render() {
           <div class="editor-head">
             <div><span class="eyebrow">当前内容块</span><h1>${blockRole(active)}</h1></div>
             <div class="review-actions">
-              <sl-button size="small" variant="${active.reviewStatus === "approved" ? "success" : "default"}" data-action="approve">${active.reviewStatus === "approved" ? "✓ 已通过" : "审核通过"}</sl-button>
+              <sl-button size="small" variant="${active.reviewStatus === "approved" ? "success" : "default"}" data-action="approve" ${activeConflict ? "disabled" : ""} title="${activeConflict ? "该块存在未裁决的回执冲突，裁决前不能通过" : "审核通过"}">${active.reviewStatus === "approved" ? "✓ 已通过" : "审核通过"}</sl-button>
               <sl-button size="small" variant="${active.reviewStatus === "needs-work" ? "danger" : "default"}" data-action="needs-work">需修改</sl-button>
             </div>
           </div>
+
+          ${conflicts.length ? `<section class="conflict-panel">
+            <div class="section-heading"><div><span class="eyebrow">Receipt conflicts</span><h2>回执冲突待裁决（${conflicts.length}）</h2></div><sl-badge variant="danger">裁决前不能通过或导出</sl-badge></div>
+            ${conflicts.map((conflict) => {
+              const conflictBlock = project.blocks.find((block) => block.id === conflict.blockId);
+              return `<div class="conflict-card ${conflict.blockId === active.id ? "current" : ""}">
+                <div class="conflict-head">
+                  <b>${conflictBlock ? blockRole(conflictBlock) : "内容块"} · 段 ${project.blocks.findIndex((block) => block.id === conflict.blockId) + 1}</b>
+                  <span>${escapeHtml(conflict.note)}（回执 ${escapeHtml(conflict.receiptId)}）</span>
+                  ${conflict.blockId !== active.id ? `<sl-button size="small" variant="text" data-action="select-block" data-block-id="${conflict.blockId}">定位</sl-button>` : ""}
+                </div>
+                <div class="conflict-columns">
+                  <div class="conflict-col">
+                    <span>本地稿 · ${statusLabel(conflict.localStatus)}</span>
+                    <p>${escapeHtml(conflict.localText)}</p>
+                    <sl-button size="small" variant="default" data-action="resolve-conflict" data-choice="local" data-conflict-id="${conflict.id}">采用本地</sl-button>
+                  </div>
+                  <div class="conflict-col remote">
+                    <span>学校回执${conflict.remoteStatus ? ` · ${statusLabel(conflict.remoteStatus)}` : ""}</span>
+                    <p>${escapeHtml(conflict.remoteText)}</p>
+                    <sl-button size="small" variant="primary" data-action="resolve-conflict" data-choice="remote" data-conflict-id="${conflict.id}">采用回执</sl-button>
+                  </div>
+                </div>
+              </div>`;
+            }).join("")}
+          </section>` : ""}
 
           ${activeIssues.length ? `<div class="active-issues">${activeIssues.map((issue) => `
             <div class="issue-card ${issue.severity}">
@@ -701,7 +1120,14 @@ app.addEventListener("click", (event) => {
       current.reviewStatus = "pending";
     }, "生成易读版本");
   }
-  if (action === "approve") updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
+  if (action === "approve") {
+    if (blockConflict(activeBlock().id)) {
+      setLastAction("该块存在未裁决的回执冲突，裁决前不能通过。");
+      render();
+      return;
+    }
+    updateActiveBlock((block) => { block.reviewStatus = "approved"; }, "审核通过");
+  }
   if (action === "needs-work") updateActiveBlock((block) => { block.reviewStatus = "needs-work"; }, "标记需修改");
   if (action === "add-comment") {
     const input = app.querySelector<HTMLElement & { value: string }>("#new-comment");
@@ -733,12 +1159,24 @@ app.addEventListener("click", (event) => {
     const source = app.querySelector<HTMLElement & { value: string }>("#new-term-source");
     const preferred = app.querySelector<HTMLElement & { value: string }>("#new-term-preferred");
     if (source?.value.trim() && preferred?.value.trim()) {
-      commit("添加术语", (draft) => { draft.glossary.push({ id: uid("term"), source: source.value.trim(), preferred: preferred.value.trim(), note: "编辑新增术语" }); });
+      commit("添加术语", (draft) => {
+        draft.glossary.push({ id: uid("term"), source: source.value.trim(), preferred: preferred.value.trim(), note: "编辑新增术语" });
+        bumpGlossaryRevision(draft);
+      }, false);
+      refreshChecks();
+      saveSoon();
+      render();
     }
   }
   if (action === "remove-term") {
     const termId = target.dataset.termId;
-    commit("删除术语", (draft) => { draft.glossary = draft.glossary.filter((term) => term.id !== termId); });
+    commit("删除术语", (draft) => {
+      draft.glossary = draft.glossary.filter((term) => term.id !== termId);
+      bumpGlossaryRevision(draft);
+    }, false);
+    refreshChecks();
+    saveSoon();
+    render();
   }
   if (action === "save-version") {
     const versionId = uid("version");
@@ -750,12 +1188,45 @@ app.addEventListener("click", (event) => {
     render();
   }
   if (action === "approve-all") {
-    commit("全部审核通过", (draft) => { draft.blocks.forEach((block) => { block.reviewStatus = "approved"; }); });
+    const blocked = new Set(openConflicts().map((conflict) => conflict.blockId));
+    commit("全部审核通过", (draft) => {
+      draft.blocks.forEach((block) => {
+        if (!blocked.has(block.id)) block.reviewStatus = "approved";
+      });
+    });
+    if (blocked.size) {
+      setLastAction(`已通过其余内容块；${blocked.size} 个块存在待裁决冲突，未予通过。`);
+      render();
+    }
   }
   if (action === "export") {
+    if (openConflicts().length) {
+      setLastAction(`仍有 ${openConflicts().length} 处回执冲突未裁决，已阻止导出。`);
+      render();
+      return;
+    }
     download(`${project.title}-无障碍版.html`, exportHtml(project));
     document.documentElement.dataset.lastAction = "已导出无障碍 HTML";
     render();
+  }
+  if (action === "import-receipt") app.querySelector<HTMLInputElement>("#receipt-file")?.click();
+  if (action === "demo-receipt") applyReceipt(buildDemoReceipt());
+  if (action === "resolve-conflict") {
+    const conflictId = target.dataset.conflictId ?? "";
+    const choice = target.dataset.choice;
+    const conflict = project.mergeConflicts.find((item) => item.id === conflictId);
+    if (conflict) {
+      commit(choice === "remote" ? "裁决：采用回执" : "裁决：采用本地", (draft) => {
+        const block = draft.blocks.find((item) => item.id === conflict.blockId);
+        if (block && choice === "remote") {
+          block.accessibleText = conflict.remoteText;
+          if (block.type === "image") block.imageAlt = conflict.remoteText;
+          if (conflict.remoteStatus) block.reviewStatus = conflict.remoteStatus;
+          block.changeReason = conflict.note;
+        }
+        draft.mergeConflicts = draft.mergeConflicts.filter((item) => item.id !== conflictId);
+      });
+    }
   }
   if (action === "import") app.querySelector<HTMLInputElement>("#chapter-file")?.click();
 });
@@ -774,12 +1245,35 @@ app.addEventListener("sl-change", (event) => {
   if (element.matches("[data-term-id]")) {
     const termId = element.dataset.termId;
     const value = (element as HTMLElement & { value: string }).value;
-    commit("修改术语表", (draft) => { const term = draft.glossary.find((item) => item.id === termId); if (term) term.preferred = value; });
+    commit("修改术语表", (draft) => {
+      const term = draft.glossary.find((item) => item.id === termId);
+      if (term && term.preferred !== value) {
+        term.preferred = value;
+        bumpGlossaryRevision(draft);
+      }
+    }, false);
+    refreshChecks();
+    saveSoon();
+    render();
   }
 });
 
 app.addEventListener("change", (event) => {
   const input = event.target as HTMLInputElement;
+  if (input.id === "receipt-file") {
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    void file.text().then((text) => {
+      const receipt = parseReceipt(text);
+      if (receipt) applyReceipt(receipt);
+      else {
+        setLastAction("回执文件不是有效的 JSON，未做任何修改。");
+        render();
+      }
+    });
+    return;
+  }
   if (input.id !== "chapter-file" || !input.files?.[0]) return;
   void input.files[0].text().then((text) => {
     commit("导入章节文本", (draft) => {
@@ -833,4 +1327,5 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "2") { previewMode = "assisted"; render(); }
 });
 
+if (!project.lastCheck) refreshChecks();
 render();
